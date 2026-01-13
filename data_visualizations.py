@@ -1,7 +1,4 @@
-# Side-by-side 2D embeddings: UMAP vs t-SNE vs PyTorch Autoencoder
-# - Excludes target from embeddings
-# - Colors points by target
-#
+# Side-by-side 2D embeddings: PCA vs Kernel PCA vs UMAP vs t-SNE vs PyTorch Denoising AE
 # pip install ucimlrepo umap-learn torch scikit-learn matplotlib
 
 import numpy as np
@@ -11,10 +8,12 @@ from ucimlrepo import fetch_ucirepo
 import umap
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
+from sklearn.decomposition import KernelPCA
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, random_split
 
 
 # -------------------------
@@ -35,6 +34,29 @@ le = LabelEncoder()
 y_enc = le.fit_transform(y)
 
 X_t = torch.from_numpy(X_scaled)
+
+
+# -------------------------
+# PCA
+# -------------------------
+pca = PCA(n_components=2, random_state=42)
+Z_pca = pca.fit_transform(X_scaled)
+
+
+# -------------------------
+# Kernel PCA
+# -------------------------
+# RBF is the most common kernel for nonlinear structure.
+# gamma=None lets sklearn pick 1 / n_features by default.
+kpca = KernelPCA(
+    n_components=2,
+    kernel="rbf",
+    gamma=None,
+    fit_inverse_transform=False,
+    eigen_solver="auto",
+    random_state=42
+)
+Z_kpca = kpca.fit_transform(X_scaled)
 
 
 # -------------------------
@@ -61,24 +83,30 @@ Z_tsne = TSNE(
 
 
 # -------------------------
-# PyTorch Autoencoder (2D latent)
+# PyTorch Denoising Autoencoder (val + early stopping + BN + dropout + weight decay)
 # -------------------------
-class AutoEncoder(nn.Module):
-    def __init__(self, input_dim, latent_dim=2):
+class DenoisingAE(nn.Module):
+    def __init__(self, input_dim, latent_dim=2, p_drop=0.2):
         super().__init__()
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 64),
+            nn.Linear(input_dim, 128),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Linear(64, 32),
+            nn.Dropout(p_drop),
+
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
             nn.ReLU(),
-            nn.Linear(32, latent_dim),
+            nn.Dropout(p_drop),
+
+            nn.Linear(64, latent_dim),
         )
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 32),
+            nn.Linear(latent_dim, 64),
             nn.ReLU(),
-            nn.Linear(32, 64),
+            nn.Linear(64, 128),
             nn.ReLU(),
-            nn.Linear(64, input_dim),
+            nn.Linear(128, input_dim),
         )
 
     def forward(self, x):
@@ -87,52 +115,139 @@ class AutoEncoder(nn.Module):
         return x_hat
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = AutoEncoder(input_dim=X_scaled.shape[1], latent_dim=2).to(device)
+def train_dae_get_latents(
+    X_t,
+    latent_dim=2,
+    batch_size=32,
+    lr=1e-3,
+    weight_decay=1e-4,
+    noise_std=0.05,
+    max_epochs=2000,
+    patience=60,
+    seed=42,
+):
+    torch.manual_seed(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-loader = DataLoader(TensorDataset(X_t), batch_size=32, shuffle=True)
-opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
-loss_fn = nn.MSELoss()
+    ds = TensorDataset(X_t)
 
-epochs = 300
-for epoch in range(epochs):
-    model.train()
-    for (xb,) in loader:
-        xb = xb.to(device)
-        opt.zero_grad()
-        loss = loss_fn(model(xb), xb)
-        loss.backward()
-        opt.step()
+    n = len(ds)
+    n_val = max(1, int(0.2 * n))
+    n_train = n - n_val
+    train_ds, val_ds = random_split(
+        ds,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(seed)
+    )
 
-model.eval()
-with torch.no_grad():
-    Z_ae = model.encoder(X_t.to(device)).cpu().numpy()
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    model = DenoisingAE(input_dim=X_t.shape[1], latent_dim=latent_dim, p_drop=0.2).to(device)
+
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    loss_fn = nn.MSELoss()
+
+    best_val = float("inf")
+    best_state = None
+    bad_epochs = 0
+
+    for epoch in range(1, max_epochs + 1):
+        model.train()
+        for (xb,) in train_loader:
+            xb = xb.to(device)
+
+            if noise_std > 0:
+                xb_in = xb + noise_std * torch.randn_like(xb)
+            else:
+                xb_in = xb
+
+            opt.zero_grad()
+            xb_hat = model(xb_in)
+            loss = loss_fn(xb_hat, xb)
+            loss.backward()
+            opt.step()
+
+        model.eval()
+        val_loss = 0.0
+        count = 0
+        with torch.no_grad():
+            for (xb,) in val_loader:
+                xb = xb.to(device)
+                xb_hat = model(xb)
+                val_loss += loss_fn(xb_hat, xb).item() * xb.size(0)
+                count += xb.size(0)
+        val_loss /= count
+
+        if val_loss < best_val - 1e-6:
+            best_val = val_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+
+        if epoch % 100 == 0 or epoch == 1:
+            print(f"epoch {epoch:4d} | val loss {val_loss:.6f}")
+
+        if bad_epochs >= patience:
+            print(f"Early stopping at epoch {epoch} (best val loss {best_val:.6f})")
+            break
+
+    model.load_state_dict(best_state)
+    model.eval()
+
+    with torch.no_grad():
+        Z = model.encoder(X_t.to(device)).cpu().numpy()
+
+    return Z
+
+
+Z_ae = train_dae_get_latents(
+    X_t,
+    latent_dim=2,
+    batch_size=32,
+    lr=1e-3,
+    weight_decay=1e-4,
+    noise_std=0.05,
+    max_epochs=2000,
+    patience=60,
+    seed=42
+)
 
 
 # -------------------------
 # Plot (side-by-side)
 # -------------------------
-fig, axes = plt.subplots(1, 3, figsize=(15, 4.8))
+fig, axes = plt.subplots(1, 5, figsize=(24, 5))
 
-sc0 = axes[0].scatter(Z_umap[:, 0], Z_umap[:, 1], c=y_enc, s=20, alpha=0.85)
-axes[0].set_title("UMAP (2D)")
-axes[0].set_xlabel("Dim 1")
-axes[0].set_ylabel("Dim 2")
+sc0 = axes[0].scatter(Z_pca[:, 0], Z_pca[:, 1], c=y_enc, s=20, alpha=0.85)
+axes[0].set_title(f"PCA (2D)\nExplained var = {pca.explained_variance_ratio_.sum():.2f}")
+axes[0].set_xlabel("PC1")
+axes[0].set_ylabel("PC2")
 
-sc1 = axes[1].scatter(Z_tsne[:, 0], Z_tsne[:, 1], c=y_enc, s=20, alpha=0.85)
-axes[1].set_title("t-SNE (2D)")
-axes[1].set_xlabel("Dim 1")
-axes[1].set_ylabel("Dim 2")
+sc1 = axes[1].scatter(Z_kpca[:, 0], Z_kpca[:, 1], c=y_enc, s=20, alpha=0.85)
+axes[1].set_title("Kernel PCA (RBF, 2D)")
+axes[1].set_xlabel("KPCA 1")
+axes[1].set_ylabel("KPCA 2")
 
-sc2 = axes[2].scatter(Z_ae[:, 0], Z_ae[:, 1], c=y_enc, s=20, alpha=0.85)
-axes[2].set_title("PyTorch Autoencoder (2D latent)")
-axes[2].set_xlabel("Latent 1")
-axes[2].set_ylabel("Latent 2")
+sc2 = axes[2].scatter(Z_umap[:, 0], Z_umap[:, 1], c=y_enc, s=20, alpha=0.85)
+axes[2].set_title("UMAP (2D)")
+axes[2].set_xlabel("Dim 1")
+axes[2].set_ylabel("Dim 2")
 
-# One shared legend (based on same classes)
+sc3 = axes[3].scatter(Z_tsne[:, 0], Z_tsne[:, 1], c=y_enc, s=20, alpha=0.85)
+axes[3].set_title("t-SNE (2D)")
+axes[3].set_xlabel("Dim 1")
+axes[3].set_ylabel("Dim 2")
+
+sc4 = axes[4].scatter(Z_ae[:, 0], Z_ae[:, 1], c=y_enc, s=20, alpha=0.85)
+axes[4].set_title("Denoising AE (2D)\nval + early stopping")
+axes[4].set_xlabel("Latent 1")
+axes[4].set_ylabel("Latent 2")
+
 handles, _ = sc0.legend_elements()
 labels = le.inverse_transform(np.arange(len(handles)))
 fig.legend(handles, labels, title="target", loc="center right")
 
-plt.tight_layout(rect=[0, 0, 0.9, 1])
+plt.tight_layout(rect=[0, 0, 0.93, 1])
 plt.show()
