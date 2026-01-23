@@ -1,9 +1,6 @@
 # data_compression
-Explores various techniques to compress the dataset. 
 
-# Getting the data
-The Wine dataset can be acquired from 
-https://archive.ics.uci.edu/dataset/109/wine
+End-to-end data exploration pipeline, from data cleaning and preprocessing to anomaly detection and data modeling.  
+This repo explores dimensionality reduction and representation learning techniques, ranging from PCA to Isolation Forests and autoencoders.
 
-or one can install the ucimlrepo library via: pip install ucimlrepo.
-
+Experimenting with various datasets and data structures.
